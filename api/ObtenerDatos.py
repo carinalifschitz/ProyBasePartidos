@@ -1,145 +1,172 @@
 import requests
-import sqlite3
+import psycopg2
+from psycopg2 import extras
 from datetime import datetime, timedelta
 import time
 
-# Configuración de cabeceras para evitar bloqueos
+# --- 1. CONFIGURACIÓN DE TU BASE DE DATOS EN SUPABASE ---
+# Copia estos datos desde el panel de Configuración -> Database de Supabase
+DB_HOST = "YOUR_PROJECT_REF.supabase.co" # Cambia esto
+DB_NAME = "postgres"                     # Por defecto en Supabase siempre es 'postgres'
+DB_USER = "postgres"                     # Por defecto es 'postgres'
+DB_PASS = "TU_CONTRASEÑA_DE_SUPABASE"    # La contraseña que creaste al inicio
+DB_PORT = "5432"
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-def conectar_db():
-    # Usamos SQLite local para el ejemplo, cámbialo por psycopg2 si usas PostgreSQL
-    return sqlite3.connect('trivia_futbol_completa.db')
+def conectar_supabase():
+    """Establece la conexión con la base de datos PostgreSQL de Supabase"""
+    return psycopg2.connect(
+        host=DB_HOST,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+        port=DB_PORT
+    )
+
+def iniciar_tablas_supabase():
+    """Crea la estructura de tablas relacionales en Supabase si no existen"""
+    conn = conectar_supabase()
+    cursor = conn.cursor()
+    
+    # Tabla Partidos
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS partidos (
+            id_partido VARCHAR(50) PRIMARY KEY,
+            fecha_partido TIMESTAMP,
+            liga_nombre VARCHAR(100),
+            equipo_local_id VARCHAR(50),
+            equipo_local_nombre VARCHAR(100),
+            equipo_local_goles INT DEFAULT 0,
+            equipo_visitante_id VARCHAR(50),
+            equipo_visitante_nombre VARCHAR(100),
+            equipo_visitante_goles INT DEFAULT 0,
+            ganador VARCHAR(20),
+            tanda_penales BOOLEAN DEFAULT FALSE,
+            fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    ''')
+    
+    # Tabla Jugadores
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS jugadores_partido (
+            id_registro VARCHAR(100) PRIMARY KEY,
+            id_partido VARCHAR(50) REFERENCES partidos(id_partido) ON DELETE CASCADE,
+            id_equipo VARCHAR(50),
+            id_jugador VARCHAR(50),
+            nombre_jugador VARCHAR(150),
+            posicion VARCHAR(50),
+            titular BOOLEAN DEFAULT TRUE
+        );
+    ''')
+    
+    # Tabla Eventos (Goles / Penales)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS eventos_partido (
+            id_evento VARCHAR(50) PRIMARY KEY,
+            id_partido VARCHAR(50) REFERENCES partidos(id_partido) ON DELETE CASCADE,
+            id_equipo VARCHAR(50),
+            id_jugador VARCHAR(50),
+            nombre_jugador VARCHAR(150),
+            tipo_evento VARCHAR(50),
+            minuto INT,
+            periodo VARCHAR(20)
+        );
+    ''')
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print("✓ Estructura de base de datos verificada en Supabase.")
 
 def obtener_partidos_dia_anterior():
-    """Busca la lista de IDs de partidos jugados ayer"""
     ayer = datetime.now() - timedelta(days=1)
-    fecha_str = ayer.strftime("%Y%m%d") # Formato: 20260620
-    
-    # Endpoint del calendario de torneos de FIFA/Internacionales
+    fecha_str = ayer.strftime("%Y%m%d")
     url_agenda = f"https://espn.com{fecha_str}"
     
     try:
         respuesta = requests.get(url_agenda, headers=HEADERS, timeout=15)
-        if respuesta.status_code != 200:
-            return []
-        
+        if respuesta.status_code != 200: return []
         datos = respuesta.json()
-        ids_partidos = []
-        for evento in datos.get('events', []):
-            ids_partidos.append(evento.get('id'))
-        return ids_partidos
+        return [evento.get('id') for evento in datos.get('events', [])]
     except Exception as e:
-        print(f"Error al obtener agenda del día anterior: {e}")
+        print(f"Error al obtener agenda: {e}")
         return []
 
-def procesar_y_guardar_detalle(id_partido):
-    """Extrae el resumen, estadísticas, jugadores y goles de un partido específico"""
+def procesar_y_guardar_en_supabase(id_partido):
     url_detalle = f"https://espn.com{id_partido}"
     
     try:
         respuesta = requests.get(url_detalle, headers=HEADERS, timeout=15)
-        if respuesta.status_code != 200:
-            return
+        if respuesta.status_code != 200: return
         
         datos = respuesta.json()
         header = datos.get('header', {})
         competitions = header.get('competitions', [{}])[0]
         competitors = competitions.get('competitors', [])
-        
-        if len(competitors) < 2:
-            return
+        if len(competitors) < 2: return
 
-        # 1. Clasificar Local y Visitante
         local = competitors[0] if competitors[0].get('homeAway') == 'home' else competitors[1]
         visitante = competitors[1] if competitors[0].get('homeAway') == 'home' else competitors[0]
         
-        # Datos generales del partido
-        liga = header.get('league', {}).get('name', 'Internacional')
-        fecha_partido = header.get('date')
-        
-        eq_local_id = local.get('team', {}).get('id')
-        eq_local_nom = local.get('team', {}).get('name')
-        goles_local = int(local.get('score', 0))
-        
-        eq_vis_id = visitante.get('team', {}).get('id')
-        eq_vis_nom = visitante.get('team', {}).get('name')
-        goles_vis = int(visitante.get('score', 0))
-        
-        ganador = 'empate'
-        if goles_local > goles_vis: ganador = 'local'
-        elif goles_vis > goles_local: ganador = 'visitante'
-        
-        # Verificar si hubo tanda de penales en el nodo de shootouts
-        hubo_penales = False
-        pen_local, pen_vis = 0, 0
-        if 'shootout' in competitions:
-            hubo_penales = True
-            # Lógica para contar los penales anotados si están disponibles en el JSON
-            
-        # --- Guardar Partido General ---
-        conn = conectar_db()
+        # Procesar Ganador
+        g_local, g_vis = int(local.get('score', 0)), int(visitante.get('score', 0))
+        ganador = 'local' if g_local > g_vis else ('visitante' if g_vis > g_local else 'empate')
+        hubo_penales = 'shootout' in competitions
+
+        conn = conectar_supabase()
         cursor = conn.cursor()
         
+        # Guardar Partido (Sintaxis UPSERT para PostgreSQL)
         cursor.execute('''
-            INSERT OR REPLACE INTO partidos 
-            (id_partido, fecha_partido, liga_nombre, equipo_local_id, equipo_local_nombre, equipo_local_goles, equipo_visitante_id, equipo_visitante_nombre, equipo_visitante_goles, ganador, tanda_penales, penales_local, penales_visitante)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (id_partido, fecha_partido, liga, eq_local_id, eq_local_nom, goles_local, eq_vis_id, eq_vis_nom, goles_vis, ganador, hubo_penales, pen_local, pen_vis))
+            INSERT INTO partidos (id_partido, fecha_partido, liga_nombre, equipo_local_id, equipo_local_nombre, equipo_local_goles, equipo_visitante_id, equipo_visitante_nombre, equipo_visitante_goles, ganador, tanda_penales)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id_partido) DO UPDATE SET
+                equipo_local_goles = EXCLUDED.equipo_local_goles,
+                equipo_visitante_goles = EXCLUDED.equipo_visitante_goles,
+                ganador = EXCLUDED.ganador;
+        ''', (id_partido, header.get('date'), header.get('league', {}).get('name'), local.get('team', {}).get('id'), local.get('team', {}).get('name'), g_local, visitante.get('team', {}).get('id'), visitante.get('team', {}).get('name'), g_vis, ganador, hubo_penales))
 
-        # 2. Extraer Jugadores (Rosters / Lineups)
-        # Nota: Dependiendo del torneo, ESPN guarda las alineaciones en el nodo 'rosters' o 'lineups'
+        # Guardar Jugadores
         for equipo_roster in datos.get('rosters', []):
             id_equipo = equipo_roster.get('team', {}).get('id')
-            for jugador_entry in equipo_roster.get('roster', []):
-                id_jugador = jugador_entry.get('athlete', {}).get('id')
-                nombre_jugador = jugador_entry.get('athlete', {}).get('displayName')
-                posicion = jugador_entry.get('athlete', {}).get('position', {}).get('name', 'Desconocido')
-                titular = jugador_entry.get('starter', True)
-                
-                id_registro = f"{id_partido}_{id_jugador}"
-                
+            for j in equipo_roster.get('roster', []):
+                id_j = j.get('athlete', {}).get('id')
+                id_reg = f"{id_partido}_{id_j}"
                 cursor.execute('''
-                    INSERT OR REPLACE INTO jugadores_partido (id_registro, id_partido, id_equipo, id_jugador, nombre_jugador, posicion, titular)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (id_registro, id_partido, id_equipo, id_jugador, nombre_jugador, posicion, titular))
+                    INSERT INTO jugadores_partido (id_registro, id_partido, id_equipo, id_jugador, nombre_jugador, posicion, titular)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id_registro) DO NOTHING;
+                ''', (id_reg, id_partido, id_equipo, id_j, j.get('athlete', {}).get('displayName'), j.get('athlete', {}).get('position', {}).get('name'), j.get('starter', True)))
 
-        # 3. Extraer Incidentes (Goles, Penales anotados/fallados)
-        # Los detalles de jugadas y goles suelen venir en el nodo 'keyEvents' o 'details' de la competencia
+        # Guardar Eventos (Goles)
         for detalle in competitions.get('details', []):
-            # Filtrar solo eventos relevantes para preguntas de trivia (Goles/Penales)
             tipo_detalle = detalle.get('type', {}).get('text', '')
             if 'Goal' in tipo_detalle or 'Penalty' in tipo_detalle:
-                id_evento = detalle.get('id', f"{id_partido}_{time.time_ns()}")
-                id_equipo_evento = detalle.get('team', {}).get('id')
-                id_atleta = detalle.get('athletesInvolved', [{}])[0].get('id', '0')
-                nom_atleta = detalle.get('athletesInvolved', [{}])[0].get('displayName', 'Desconocido')
-                minuto = detalle.get('clock', {}).get('displayValue', '0').replace("'", "")
-                periodo = detalle.get('type', {}).get('period', '1H')
+                id_ev = detalle.get('id', f"{id_partido}_{time.time_ns()}")
+                minuto = int(''.join(filter(str.isdigit, detalle.get('clock', {}).get('displayValue', '0'))))
                 
                 cursor.execute('''
-                    INSERT OR REPLACE INTO eventos_partido (id_evento, id_partido, id_equipo, id_jugador, nombre_jugador, tipo_evento, minuto, periodo)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (id_evento, id_partido, id_equipo_evento, id_atleta, nom_atleta, tipo_detalle, minuto, periodo))
+                    INSERT INTO eventos_partido (id_evento, id_partido, id_equipo, id_jugador, nombre_jugador, tipo_evento, minuto, periodo)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id_evento) DO NOTHING;
+                ''', (id_ev, id_partido, detalle.get('team', {}).get('id'), "0", detalle.get('athletesInvolved', [{}])[0].get('displayName', 'Desconocido'), tipo_detalle, minuto, "REGULAR"))
 
         conn.commit()
+        cursor.close()
         conn.close()
-        print(f"-> Procesado con éxito partido ID: {id_partido} ({eq_local_nom} vs {eq_vis_nom})")
+        print(f"-> Sincronizado en la nube: {local.get('team', {}).get('name')} vs {visitante.get('team', {}).get('name')}")
         
     except Exception as e:
-        print(f"Error procesando el detalle del partido {id_partido}: {e}")
+        print(f"Error procesando partido {id_partido}: {e}")
 
-def tarea_diaria_extraccion():
-    print(f"[{datetime.now()}] Iniciando descarga de partidos de ayer...")
-    partidos_ayer = obtener_partidos_dia_anterior()
-    print(f"Se encontraron {len(partidos_ayer)} partidos para procesar.")
-    
-    for id_p in partidos_ayer:
-        procesar_y_guardar_detalle(id_p)
-        time.sleep(2) # Pausa de 2 segundos entre partidos para no saturar ni levantar alertas en ESPN
-    print(f"[{datetime.now()}] Extracción diaria completada.")
+def ejecutar_cron_diario():
+    iniciar_tablas_supabase()
+    partidos = obtener_partidos_dia_anterior()
+    print(f"Procesando {len(partidos)} partidos de ayer...")
+    for id_p in partidos:
+        procesar_y_guardar_en_supabase(id_p)
+        time.sleep(2)
 
 if __name__ == "__main__":
-    # Si lo ejecutas manualmente, correrá inmediatamente
-    tarea_diaria_extraccion()
+    ejecutar_cron_diario()
